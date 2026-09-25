@@ -99,12 +99,17 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
     枚举最多记录 ``MAX_PATHS`` 条（含到基准、死路、断档与成环的各类终止）。
     达到上限后仍有未展开的分支时 ``truncated=True``——调用方不得再把已
     枚举的样本当作“全部候选”给出唯一或断裂的定论。
+
+    深度优先枚举使用**显式栈**而非递归：单条深链（有效父证书逐级相连，
+    深度超过 Python 递归上限）也能完整枚举，不会抛出 RecursionError。
+    栈帧语义与递归版一一对应——帧入口先查上限，再判到基准/死路终止，
+    否则按确定性顺序逐条处理父边（每条边处理前复核上限）。
     """
     paths: list[dict[str, Any]] = []
     truncated = False
 
     def cap_reached() -> bool:
-        # 统一在上限处收口：包括同一 DFS 帧内循环边产生的终止记录，
+        # 统一在上限处收口：包括同一帧内循环边产生的终止记录，
         # 避免“帧入口检查通过后在 for 循环中连续 record”越过上限。
         if len(paths) >= MAX_PATHS:
             return True
@@ -131,43 +136,65 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
             }
         )
 
-    def dfs(cert_ids, edge_ids, visited):
-        nonlocal truncated
+    # 显式栈帧：[cert_ids, edge_ids, visited, parents, next_edge_idx]
+    # parents 为 None 表示帧刚压栈、尚未执行帧入口逻辑（对应递归调用进入）。
+    for start in starts:
         if cap_reached():
             truncated = True
-            return
-        current = cert_ids[-1]
-        current_cert = cat.certs[current]
-        current_inst = cat.instruments[current_cert["instrument_code"]]
-        parents = active_parents(current)
+            break
+        stack: list[list[Any]] = [[[start], [], {start}, None, 0]]
+        while stack:
+            frame = stack[-1]
+            cert_ids, edge_ids, visited, parents, next_idx = frame
 
-        if current_inst["is_national_standard"]:
-            record(cert_ids, edge_ids, True, False, [])
-            return
-        if not parents:
-            record(
-                cert_ids,
-                edge_ids,
-                False,
-                False,
-                [
-                    _conflict(
-                        "DEAD_END",
-                        "ERROR",
-                        f"证书 {current}（{current_cert['cert_number']}）"
-                        "在该时点没有任何有效的向上溯源边，无法到达国家基准",
-                        node=current,
+            if parents is None:
+                # ---- 帧入口（对应递归 dfs 的函数体开头）----
+                if cap_reached():
+                    truncated = True
+                    stack.pop()
+                    continue
+                current = cert_ids[-1]
+                current_cert = cat.certs[current]
+                current_inst = cat.instruments[current_cert["instrument_code"]]
+                parents = active_parents(current)
+
+                if current_inst["is_national_standard"]:
+                    record(cert_ids, edge_ids, True, False, [])
+                    stack.pop()
+                    continue
+                if not parents:
+                    record(
+                        cert_ids,
+                        edge_ids,
+                        False,
+                        False,
+                        [
+                            _conflict(
+                                "DEAD_END",
+                                "ERROR",
+                                f"证书 {current}（{current_cert['cert_number']}）"
+                                "在该时点没有任何有效的向上溯源边，无法到达国家基准",
+                                node=current,
+                            )
+                        ],
                     )
-                ],
-            )
-            return
+                    stack.pop()
+                    continue
+                frame[3] = parents
+                continue
 
-        for edge in parents:
+            # ---- 帧恢复：按序取下一条父边（对应递归 for 循环的一次迭代）----
+            if next_idx >= len(parents):
+                stack.pop()  # 全部父边处理完毕，对应递归函数自然返回
+                continue
             # 同一帧内每条父边都可能产生一条终止记录（成环/父证书失效），
             # 故必须在每条边处理前复核上限，确保截断时余下分支不再记录。
             if cap_reached():
                 truncated = True
-                return
+                stack.pop()
+                continue
+            frame[4] = next_idx + 1
+            edge = parents[next_idx]
             pid = edge["parent_cert_id"]
             if pid in visited:
                 issues = [
@@ -208,13 +235,10 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
                     issues,
                 )
                 continue
-            dfs(cert_ids + [pid], edge_ids + [edge["id"]], visited | {pid})
-
-    for start in starts:
-        if cap_reached():
-            truncated = True
-            break
-        dfs([start], [], {start})
+            # 向父证书深入一层：压入新帧（对应递归调用 dfs(...)）
+            stack.append(
+                [cert_ids + [pid], edge_ids + [edge["id"]], visited | {pid}, None, 0]
+            )
 
     # 完全相同的节点序列去重
     dedup: dict[tuple, dict[str, Any]] = {}

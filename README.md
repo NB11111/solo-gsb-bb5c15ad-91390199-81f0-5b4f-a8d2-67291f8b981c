@@ -60,7 +60,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（197 个用例）
+pytest -q        # 运行测试（204 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -875,7 +875,9 @@ curl -X DELETE http://localhost:8000/api/calibration-maintenance-windows/MW-2026
 
 #### 4.0）枚举上限与“结果未定”（undetermined）
 
-候选链按 DFS 枚举，最多记录 **500 条**（含到基准、死路、断档与成环的各类
+候选链按 DFS 枚举（**显式栈**实现，不使用递归——单条深链的有效父证书
+逐级相连、深度超过 Python 递归上限时也能完整枚举，不会因此返回 500），
+最多记录 **500 条**（含到基准、死路、断档与成环的各类
 终止）。达到上限后**仍有未展开分支**时，已枚举的路径只是样本，服务按下列
 规则定论，避免把样本误判为唯一或断裂：
 
@@ -1554,7 +1556,7 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
-2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护——达到上限且仍有未展开分支时置 `paths_truncated=true`）；
+2. 自起点沿在 `at` 有效的边做 DFS 枚举（**显式栈**实现，深链不受 Python 递归上限限制；同父子证书的并行边合并；检测环；500 条上限保护——达到上限且仍有未展开分支时置 `paths_truncated=true`）；
 3. 终止条件：到达国家基准仪器证书（成链）、无有效边（死路）、父证书失效（断档）、成环；
 4. 对每条链执行节点级（时点有效性、签名摘要）与链级（父区间覆盖校准时刻、
    不确定度单调不收缩、单位一致、边覆盖校准时刻）检查；对链上全部仪器检查
@@ -1645,7 +1647,7 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验、证书修订历史（连续版本快照）
-  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
+  engine.py          溯源链重建（DFS，显式栈实现）、校验规则、停用影响模拟（内存 Catalog）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
                      批次共同溯源核查（共同证书选举 + 子链截取）、
                      测量相容性评估（En 数 + 极大团分组）、

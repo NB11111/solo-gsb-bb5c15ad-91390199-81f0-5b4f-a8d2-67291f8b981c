@@ -60,7 +60,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（197 个用例）
+pytest -q        # 运行测试（205 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -876,7 +876,10 @@ curl -X DELETE http://localhost:8000/api/calibration-maintenance-windows/MW-2026
 #### 4.0）枚举上限与“结果未定”（undetermined）
 
 候选链按 DFS 枚举，最多记录 **500 条**（含到基准、死路、断档与成环的各类
-终止）。达到上限后**仍有未展开分支**时，已枚举的路径只是样本，服务按下列
+终止）。枚举以**显式栈**遍历（非递归），因此单条溯源链即使经超过 Python
+默认递归深度（1000）的逐级父证书连到国家基准，也不会触发
+`RecursionError`；起点与父边的确定性顺序、各类终止记录与下述截断语义保持
+不变。达到上限后**仍有未展开分支**时，已枚举的路径只是样本，服务按下列
 规则定论，避免把样本误判为唯一或断裂：
 
 - 已见 **≥2 条**到基准且校验通过的合格链 —— 多候选结论不受截断影响，

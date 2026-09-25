@@ -8,7 +8,8 @@
 * 查询时给定仪器与时点 ``at``：
 
   1. 取该仪器在 ``at`` 生效（区间闭区间）的证书作为起点；0 张=断裂，>1 张=多源冲突；
-  2. 自起点沿在 ``at`` 有效的边做深度优先枚举，直到“仪器为国家基准”的证书（成链）、
+  2. 自起点沿在 ``at`` 有效的边做深度优先枚举（显式栈遍历，链深超过 Python
+     默认递归深度也不会 RecursionError），直到“仪器为国家基准”的证书（成链）、
      无边可走（死路）、父证书在该时点失效（断档）或遇到环；
   3. 对每条链执行：签名摘要重算、父区间是否覆盖子校准时刻、测量不确定度
      沿链不得收缩（逐级放大）、单位一致性；
@@ -99,16 +100,15 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
     枚举最多记录 ``MAX_PATHS`` 条（含到基准、死路、断档与成环的各类终止）。
     达到上限后仍有未展开的分支时 ``truncated=True``——调用方不得再把已
     枚举的样本当作“全部候选”给出唯一或断裂的定论。
+
+    遍历采用**显式栈**而非递归 DFS：有效溯源链可能由超过 Python 默认递归
+    深度（1000）的逐级父证书构成（例如经上千级中间标准器连到国家基准），
+    递归实现会在单条深链上抛出 ``RecursionError``。显式栈遍历保持与递归
+    DFS 完全一致的行为——起点与父边（父证书 id 字典序）的确定性访问次序、
+    成环/失效父证书/死路的终止记录以及 500 条路径截断语义。
     """
     paths: list[dict[str, Any]] = []
     truncated = False
-
-    def cap_reached() -> bool:
-        # 统一在上限处收口：包括同一 DFS 帧内循环边产生的终止记录，
-        # 避免“帧入口检查通过后在 for 循环中连续 record”越过上限。
-        if len(paths) >= MAX_PATHS:
-            return True
-        return False
 
     def active_parents(cid: str) -> list[sqlite3.Row]:
         # 同一父证书的并行边视为同一“仪器级”溯源步，取 id 最小的边，保持确定性
@@ -131,90 +131,131 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
             }
         )
 
-    def dfs(cert_ids, edge_ids, visited):
-        nonlocal truncated
-        if cap_reached():
-            truncated = True
-            return
+    # 显式 DFS 栈帧：一条“从某当前证书继续向上”的待处理工作。
+    # cert_ids/edge_ids 为叶子到当前证书的完整前缀（入帧时快照），
+    # visited 为该前缀上已出现的证书集合，next_idx 指向下一条待处理父边。
+    # 父边按 active_parents 的确定性顺序（父证书 id 字典序）逐条推进，
+    # 与递归 DFS 的前序枚举次序一致。
+    frames: list[dict[str, Any]] = []
+    for start in reversed(starts):
+        frames.append(
+            {
+                "cert_ids": [start],
+                "edge_ids": [],
+                "visited": {start},
+                "parents": None,
+                "next_idx": 0,
+            }
+        )
+
+    while frames:
+        frame = frames[-1]
+        cert_ids = frame["cert_ids"]
+        edge_ids = frame["edge_ids"]
         current = cert_ids[-1]
-        current_cert = cat.certs[current]
-        current_inst = cat.instruments[current_cert["instrument_code"]]
-        parents = active_parents(current)
 
-        if current_inst["is_national_standard"]:
-            record(cert_ids, edge_ids, True, False, [])
-            return
-        if not parents:
-            record(
-                cert_ids,
-                edge_ids,
-                False,
-                False,
-                [
-                    _conflict(
-                        "DEAD_END",
-                        "ERROR",
-                        f"证书 {current}（{current_cert['cert_number']}）"
-                        "在该时点没有任何有效的向上溯源边，无法到达国家基准",
-                        node=current,
-                    )
-                ],
-            )
-            return
-
-        for edge in parents:
-            # 同一帧内每条父边都可能产生一条终止记录（成环/父证书失效），
-            # 故必须在每条边处理前复核上限，确保截断时余下分支不再记录。
-            if cap_reached():
+        if frame["parents"] is None:
+            # 帧入口（对应递归 dfs 入口处的上限复核：起点帧同样经此进入）：
+            # 仍有未进入的节点即说明上限外存在未展开工作。
+            if len(paths) >= MAX_PATHS:
                 truncated = True
-                return
-            pid = edge["parent_cert_id"]
-            if pid in visited:
-                issues = [
-                    _conflict(
-                        "CYCLE_DETECTED",
-                        "ERROR",
-                        f"溯源关系存在环：证书 {pid} 在链路中重复出现",
-                        node=pid,
-                        detail={"edge_id": edge["id"]},
-                    )
-                ]
-                record(cert_ids + [pid], edge_ids + [edge["id"]], False, True, issues)
+                break
+            # 先判定根/死路，再准备有序父边列表；两者均不继续向上，
+            # 记录后直接弹帧。
+            current_cert = cat.certs[current]
+            current_inst = cat.instruments[current_cert["instrument_code"]]
+            if current_inst["is_national_standard"]:
+                record(cert_ids, edge_ids, True, False, [])
+                frames.pop()
                 continue
-            parent_cert = cat.certs.get(pid)
-            if parent_cert is None:
-                continue
-            if not (parent_cert["valid_from"] <= at_s <= parent_cert["valid_until"]):
-                issues = [
-                    _conflict(
-                        "PARENT_CERT_NOT_ACTIVE",
-                        "ERROR",
-                        f"父证书 {pid} 在查询时点 {at_s} 已失效或尚未生效"
-                        f"（有效区间 {parent_cert['valid_from']} ~ "
-                        f"{parent_cert['valid_until']}），溯源链在此断裂",
-                        node=pid,
-                        detail={
-                            "edge_id": edge["id"],
-                            "valid_from": parent_cert["valid_from"],
-                            "valid_until": parent_cert["valid_until"],
-                        },
-                    )
-                ]
+            parents = active_parents(current)
+            if not parents:
                 record(
-                    cert_ids + [pid],
-                    edge_ids + [edge["id"]],
+                    cert_ids,
+                    edge_ids,
                     False,
                     False,
-                    issues,
+                    [
+                        _conflict(
+                            "DEAD_END",
+                            "ERROR",
+                            f"证书 {current}（{current_cert['cert_number']}）"
+                            "在该时点没有任何有效的向上溯源边，无法到达国家基准",
+                            node=current,
+                        )
+                    ],
                 )
+                frames.pop()
                 continue
-            dfs(cert_ids + [pid], edge_ids + [edge["id"]], visited | {pid})
+            frame["parents"] = parents
 
-    for start in starts:
-        if cap_reached():
+        parents = frame["parents"]
+        if frame["next_idx"] >= len(parents):
+            # 全部父边恰好处理完（对应递归 for 循环自然结束、不再复核上限）：
+            # 直接回溯弹帧——恰好在第 MAX_PATHS 条终止处穷尽不算截断。
+            frames.pop()
+            continue
+
+        # 尚有未处理父边（对应递归 for 循环取到下一条边时的入口检查）。
+        # 同一帧内每条父边都可能产生一条终止记录（成环/父证书失效），
+        # 故必须在每条边处理前复核上限，确保截断时余下分支不再记录。
+        if len(paths) >= MAX_PATHS:
             truncated = True
             break
-        dfs([start], [], {start})
+
+        edge = parents[frame["next_idx"]]
+        frame["next_idx"] += 1
+        pid = edge["parent_cert_id"]
+        if pid in frame["visited"]:
+            issues = [
+                _conflict(
+                    "CYCLE_DETECTED",
+                    "ERROR",
+                    f"溯源关系存在环：证书 {pid} 在链路中重复出现",
+                    node=pid,
+                    detail={"edge_id": edge["id"]},
+                )
+            ]
+            record(cert_ids + [pid], edge_ids + [edge["id"]], False, True, issues)
+            continue
+        parent_cert = cat.certs.get(pid)
+        if parent_cert is None:
+            continue
+        if not (parent_cert["valid_from"] <= at_s <= parent_cert["valid_until"]):
+            issues = [
+                _conflict(
+                    "PARENT_CERT_NOT_ACTIVE",
+                    "ERROR",
+                    f"父证书 {pid} 在查询时点 {at_s} 已失效或尚未生效"
+                    f"（有效区间 {parent_cert['valid_from']} ~ "
+                    f"{parent_cert['valid_until']}），溯源链在此断裂",
+                    node=pid,
+                    detail={
+                        "edge_id": edge["id"],
+                        "valid_from": parent_cert["valid_from"],
+                        "valid_until": parent_cert["valid_until"],
+                    },
+                )
+            ]
+            record(
+                cert_ids + [pid],
+                edge_ids + [edge["id"]],
+                False,
+                False,
+                issues,
+            )
+            continue
+        # 有效父边：压入子帧（对应递归 dfs 调用）；子帧弹栈后本帧
+        # next_idx 已推进，会继续处理下一条有序父边。
+        frames.append(
+            {
+                "cert_ids": cert_ids + [pid],
+                "edge_ids": edge_ids + [edge["id"]],
+                "visited": frame["visited"] | {pid},
+                "parents": None,
+                "next_idx": 0,
+            }
+        )
 
     # 完全相同的节点序列去重
     dedup: dict[tuple, dict[str, Any]] = {}
